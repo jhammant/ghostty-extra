@@ -1023,11 +1023,47 @@ pub const StreamHandler = struct {
 
             self.surfaceMessageWriter(.{ .set_title = buf });
             self.seen_title = false;
+
+            // Clear app context when title is reset
+            self.updateAppContext(null);
             return;
         }
 
         self.seen_title = true;
         self.surfaceMessageWriter(.{ .set_title = buf });
+
+        // Update app context for conditional configuration.
+        // Shell integration sends the command as the title during preexec.
+        self.updateAppContext(title);
+    }
+
+    /// Updates the app context for per-app conditional configuration.
+    /// Extracts the command name from the title and notifies the surface
+    /// if it looks like a command (not a path).
+    fn updateAppContext(self: *StreamHandler, title: ?[]const u8) void {
+        var app_buf: [64]u8 = undefined;
+
+        if (title) |t| {
+            // Skip if title looks like a path (pwd fallback or file paths)
+            if (t.len > 0 and (t[0] == '/' or t[0] == '~')) return;
+
+            // Extract command name (first word before space or end)
+            const cmd_end = std.mem.indexOfScalar(u8, t, ' ') orelse t.len;
+            const cmd = t[0..cmd_end];
+
+            // Skip empty commands
+            if (cmd.len == 0) return;
+
+            // Limit to buffer size minus null terminator
+            const copy_len = @min(cmd.len, app_buf.len - 1);
+            @memcpy(app_buf[0..copy_len], cmd[0..copy_len]);
+            app_buf[copy_len] = 0;
+        } else {
+            // Clear app context
+            app_buf[0] = 0;
+        }
+
+        self.surfaceMessageWriter(.{ .app_context = app_buf });
     }
 
     inline fn setMouseShape(

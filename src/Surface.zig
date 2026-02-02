@@ -820,6 +820,9 @@ pub fn deinit(self: *Surface) void {
     self.alloc.destroy(self.renderer_state.mutex);
     self.config.deinit();
 
+    // Clean up conditional state
+    if (self.config_conditional_state.app) |app| self.alloc.free(app);
+
     log.info("surface closed addr={x}", .{@intFromPtr(self)});
 }
 
@@ -1133,6 +1136,12 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             ) catch |err| {
                 log.warn("apprt failed to notify command finish={}", .{err});
             };
+        },
+
+        .app_context => |*v| {
+            // Extract null-terminated string from the buffer
+            const slice = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(v)), 0);
+            try self.updateAppContext(slice);
         },
 
         .search_total => |v| {
@@ -1685,6 +1694,43 @@ fn notifyConfigConditionalState(self: *Surface) void {
     ) catch |err| {
         log.warn("failed to notify app of config state change err={}", .{err});
     };
+}
+
+/// Update the app context for per-app conditional configuration.
+/// This is called when the foreground application changes (via shell integration).
+fn updateAppContext(self: *Surface, app: []const u8) !void {
+    // Get the new app value, treating empty string as null
+    const new_app: ?[]const u8 = if (app.len > 0) app else null;
+
+    // Check if the app actually changed
+    const current_app = self.config_conditional_state.app;
+    const changed = changed: {
+        if (current_app == null and new_app == null) break :changed false;
+        if (current_app == null or new_app == null) break :changed true;
+        break :changed !std.ascii.eqlIgnoreCase(current_app.?, new_app.?);
+    };
+
+    if (!changed) return;
+
+    log.debug("app context changed: {?s} -> {?s}", .{ current_app, new_app });
+
+    // Update our conditional state
+    // Note: We need to dupe the string since it comes from a message buffer
+    if (new_app) |app_str| {
+        // Free old app string if we own it
+        if (self.config_conditional_state.app) |old| {
+            self.alloc.free(old);
+        }
+        self.config_conditional_state.app = try self.alloc.dupe(u8, app_str);
+    } else {
+        if (self.config_conditional_state.app) |old| {
+            self.alloc.free(old);
+        }
+        self.config_conditional_state.app = null;
+    }
+
+    // Trigger config reload with the new conditional state
+    self.notifyConfigConditionalState();
 }
 
 /// Update our configuration at runtime. This can be called by the apprt

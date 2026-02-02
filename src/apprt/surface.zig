@@ -99,6 +99,11 @@ pub const Message = union(enum) {
     /// of the command.
     stop_command: ?u8,
 
+    /// The foreground application/command has changed. This is used to
+    /// trigger per-app conditional configuration. The value is a fixed-size
+    /// buffer containing the command name (null-terminated).
+    app_context: [64]u8,
+
     /// The scrollbar state changed for the surface.
     scrollbar: terminal.Scrollbar,
 

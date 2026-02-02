@@ -13,18 +13,31 @@ pub const State = struct {
     /// The target OS of the current build.
     os: std.Target.Os.Tag = builtin.target.os.tag,
 
+    /// The currently running foreground application/command name.
+    /// This is typically set via shell integration when a command starts.
+    /// The value is the command name (first word of the command line).
+    app: ?[]const u8 = null,
+
     pub const Theme = enum { light, dark };
 
     /// Tests the conditional against the state and returns true if it matches.
     pub fn match(self: State, cond: Conditional) bool {
         switch (cond.key) {
+            .app => {
+                // App matching uses case-insensitive comparison on the
+                // command name (first word, without arguments).
+                const current_app = self.app orelse return cond.op == .ne;
+                const matches = matchAppPattern(current_app, cond.value);
+                return switch (cond.op) {
+                    .eq => matches,
+                    .ne => !matches,
+                };
+            },
             inline else => |tag| {
                 // The raw value of the state field.
                 const raw = @field(self, @tagName(tag));
 
-                // Since all values are enums currently then we can just
-                // do this. If we introduce non-enum state values then this
-                // will be a compile error and we should fix here.
+                // For enum values, convert to tag name for comparison.
                 const value: []const u8 = @tagName(raw);
 
                 return switch (cond.op) {
@@ -33,6 +46,15 @@ pub const State = struct {
                 };
             },
         }
+    }
+
+    /// Matches an app pattern against the current app string.
+    /// - Extracts command name (first word before space)
+    /// - Case-insensitive comparison
+    fn matchAppPattern(app: []const u8, pattern: []const u8) bool {
+        // Extract command name (first word) from the full command
+        const app_cmd = if (std.mem.indexOfScalar(u8, app, ' ')) |i| app[0..i] else app;
+        return std.ascii.eqlIgnoreCase(app_cmd, pattern);
     }
 };
 
@@ -90,5 +112,64 @@ test "conditional enum match" {
         .key = .theme,
         .op = .ne,
         .value = "light",
+    }));
+}
+
+test "app conditional matching" {
+    const testing = std.testing;
+    const state: State = .{ .app = "vim" };
+    try testing.expect(state.match(.{
+        .key = .app,
+        .op = .eq,
+        .value = "vim",
+    }));
+    // Case insensitive
+    try testing.expect(state.match(.{
+        .key = .app,
+        .op = .eq,
+        .value = "VIM",
+    }));
+    try testing.expect(!state.match(.{
+        .key = .app,
+        .op = .eq,
+        .value = "nano",
+    }));
+    try testing.expect(state.match(.{
+        .key = .app,
+        .op = .ne,
+        .value = "nano",
+    }));
+}
+
+test "app conditional with command args" {
+    const testing = std.testing;
+    // Shell integration sends full command with args as title
+    const state: State = .{ .app = "vim file.txt" };
+    try testing.expect(state.match(.{
+        .key = .app,
+        .op = .eq,
+        .value = "vim",
+    }));
+    try testing.expect(!state.match(.{
+        .key = .app,
+        .op = .eq,
+        .value = "file.txt",
+    }));
+}
+
+test "app conditional null handling" {
+    const testing = std.testing;
+    const state: State = .{ .app = null };
+    // When app is null, eq should fail
+    try testing.expect(!state.match(.{
+        .key = .app,
+        .op = .eq,
+        .value = "vim",
+    }));
+    // When app is null, ne should succeed
+    try testing.expect(state.match(.{
+        .key = .app,
+        .op = .ne,
+        .value = "vim",
     }));
 }
