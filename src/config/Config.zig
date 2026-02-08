@@ -4547,13 +4547,13 @@ pub fn finalize(self: *Config) !void {
 }
 
 /// Callback for src/cli/args.zig to allow us to handle special cases
-/// like `--help` or `-e`. Returns "false" if the CLI parsing should halt.
+/// like `--help` or `-e`.
 pub fn parseManuallyHook(
     self: *Config,
     alloc: Allocator,
     arg: []const u8,
     iter: anytype,
-) !bool {
+) !cli.args.HookResult {
     if (std.mem.eql(u8, arg, "-e")) {
         // Add the special -e marker. This prevents:
         // (1) config-file from adding args to the end (see #2908)
@@ -4582,7 +4582,7 @@ pub fn parseManuallyHook(
                 ),
             });
 
-            return false;
+            return .stop;
         }
 
         // See "command" docs for the implied configurations and why.
@@ -4595,17 +4595,49 @@ pub fn parseManuallyHook(
         }
 
         // Do not continue, we consumed everything.
-        return false;
+        return .stop;
     }
 
     // Keep track of our input args for replay
-    try self._replay_steps.append(
-        alloc,
-        .{ .arg = try alloc.dupeZ(u8, arg) },
-    );
+    // Check if the iterator has active conditions from section headers
+    const conditions: ?[]const Conditional = if (@hasDecl(@TypeOf(iter.*), "getActiveConditions"))
+        iter.getActiveConditions()
+    else
+        null;
+
+    if (conditions) |conds| {
+        // Clone conditions and arg into the arena for replay
+        const arena_conds = try alloc.alloc(Conditional, conds.len);
+        for (conds, 0..) |cond, i| {
+            arena_conds[i] = try cond.clone(alloc);
+        }
+        try self._replay_steps.append(alloc, .{ .conditional_arg = .{
+            .conditions = arena_conds,
+            .arg = try alloc.dupe(u8, arg),
+        } });
+
+        // Check if conditions match the current state
+        // If they don't match, skip parsing this arg but continue with the next one
+        for (conds) |cond| {
+            if (!self._conditional_state.match(cond)) {
+                // Conditions don't match - skip parsing but continue with next arg
+                return .skip;
+            }
+        }
+
+        // Mark the conditional key as used so changeConditionalState knows to replay
+        for (conds) |cond| {
+            self._conditional_set.insert(cond.key);
+        }
+    } else {
+        try self._replay_steps.append(
+            alloc,
+            .{ .arg = try alloc.dupeZ(u8, arg) },
+        );
+    }
 
     // If we didn't find a special case, continue parsing normally
-    return true;
+    return .@"continue";
 }
 
 fn compatGtkTabsLocation(
@@ -9855,7 +9887,7 @@ test "parse hook: invalid command" {
     const alloc = cfg._arena.?.allocator();
 
     var it: TestIterator = .{ .data = &.{"foo"} };
-    try testing.expect(try cfg.parseManuallyHook(alloc, "--command", &it));
+    try testing.expectEqual(cli.args.HookResult.@"continue", try cfg.parseManuallyHook(alloc, "--command", &it));
     try testing.expect(cfg.command == null);
 }
 
@@ -9866,7 +9898,7 @@ test "parse e: command only" {
     const alloc = cfg._arena.?.allocator();
 
     var it: TestIterator = .{ .data = &.{"foo"} };
-    try testing.expect(!try cfg.parseManuallyHook(alloc, "-e", &it));
+    try testing.expectEqual(cli.args.HookResult.stop, try cfg.parseManuallyHook(alloc, "-e", &it));
 
     const cmd = cfg.@"initial-command".?;
     try testing.expect(cmd == .direct);
@@ -9881,7 +9913,7 @@ test "parse e: command and args" {
     const alloc = cfg._arena.?.allocator();
 
     var it: TestIterator = .{ .data = &.{ "echo", "foo", "bar baz" } };
-    try testing.expect(!try cfg.parseManuallyHook(alloc, "-e", &it));
+    try testing.expectEqual(cli.args.HookResult.stop, try cfg.parseManuallyHook(alloc, "-e", &it));
 
     const cmd = cfg.@"initial-command".?;
     try testing.expect(cmd == .direct);
@@ -10421,4 +10453,120 @@ test "compatibility: window new-window" {
             cfg.@"macos-dock-drop-behavior",
         );
     }
+}
+
+test "conditional section header creates conditional_arg replay steps" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    // Parse config with section headers using LineIterator
+    var reader: std.Io.Reader = .fixed(
+        \\scrollback-limit = 1000
+        \\[conditional:app=claude]
+        \\scrollback-limit = 2000
+        \\[]
+        \\scrollback-limit = 3000
+    );
+    var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = "test" };
+    try cli.args.parse(Config, alloc, &cfg, &iter);
+
+    // Verify we have the expected replay steps
+    const steps = cfg._replay_steps.items;
+
+    // First arg should be unconditional
+    try testing.expect(steps[0] == .arg);
+    try testing.expectEqualStrings("--scrollback-limit=1000", steps[0].arg);
+
+    // Second arg should be conditional with app=claude
+    try testing.expect(steps[1] == .conditional_arg);
+    try testing.expectEqual(@as(usize, 1), steps[1].conditional_arg.conditions.len);
+    try testing.expectEqual(conditional.Key.app, steps[1].conditional_arg.conditions[0].key);
+    try testing.expectEqual(Conditional.Op.eq, steps[1].conditional_arg.conditions[0].op);
+    try testing.expectEqualStrings("claude", steps[1].conditional_arg.conditions[0].value);
+    try testing.expectEqualStrings("--scrollback-limit=2000", steps[1].conditional_arg.arg);
+
+    // Third arg should be unconditional again
+    try testing.expect(steps[2] == .arg);
+    try testing.expectEqualStrings("--scrollback-limit=3000", steps[2].arg);
+}
+
+test "conditional section with multiple conditions" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    var reader: std.Io.Reader = .fixed(
+        \\[conditional:app=claude,theme=dark]
+        \\scrollback-limit = 5000
+    );
+    var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = "test" };
+    try cli.args.parse(Config, alloc, &cfg, &iter);
+
+    const steps = cfg._replay_steps.items;
+    try testing.expect(steps[0] == .conditional_arg);
+    try testing.expectEqual(@as(usize, 2), steps[0].conditional_arg.conditions.len);
+    try testing.expectEqual(conditional.Key.app, steps[0].conditional_arg.conditions[0].key);
+    try testing.expectEqual(conditional.Key.theme, steps[0].conditional_arg.conditions[1].key);
+}
+
+test "conditional replay applies when state matches" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    // Parse config with conditional section
+    var reader: std.Io.Reader = .fixed(
+        \\scrollback-limit = 1000
+        \\[conditional:app=claude]
+        \\scrollback-limit = 2000
+    );
+    var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = "test" };
+    try cli.args.parse(Config, alloc, &cfg, &iter);
+    try cfg.finalize();
+
+    // Default state (no app set) - should have value 1000
+    try testing.expectEqual(@as(u32, 1000), cfg.@"scrollback-limit");
+
+    // Mark the 'app' key as conditional so changeConditionalState will replay
+    cfg._conditional_set.insert(.app);
+
+    // Change state to app=claude using changeConditionalState - should have value 2000
+    var cfg2 = (try cfg.changeConditionalState(.{ .app = "claude" })).?;
+    defer cfg2.deinit();
+
+    try testing.expectEqual(@as(u32, 2000), cfg2.@"scrollback-limit");
+}
+
+test "conditional replay does not apply when state does not match" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    // Parse config with conditional section
+    var reader: std.Io.Reader = .fixed(
+        \\scrollback-limit = 1000
+        \\[conditional:app=claude]
+        \\scrollback-limit = 2000
+    );
+    var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = "test" };
+    try cli.args.parse(Config, alloc, &cfg, &iter);
+    try cfg.finalize();
+
+    // Mark the 'app' key as conditional so changeConditionalState will replay
+    cfg._conditional_set.insert(.app);
+
+    // Change state to app=vim using changeConditionalState - should still have value 1000
+    var cfg2 = (try cfg.changeConditionalState(.{ .app = "vim" })).?;
+    defer cfg2.deinit();
+
+    try testing.expectEqual(@as(u32, 1000), cfg2.@"scrollback-limit");
 }

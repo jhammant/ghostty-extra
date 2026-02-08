@@ -93,6 +93,25 @@ pub const Conditional = struct {
             .value = try alloc.dupe(u8, self.value),
         };
     }
+
+    /// Parse a condition from "key=value" or "key!=value" format.
+    /// Returns null if the string cannot be parsed as a valid conditional.
+    pub fn parse(s: []const u8) ?Conditional {
+        // Check for != first (longer operator)
+        if (std.mem.indexOf(u8, s, "!=")) |idx| {
+            const key_str = std.mem.trim(u8, s[0..idx], " \t");
+            const value = std.mem.trim(u8, s[idx + 2 ..], " \t");
+            const key = std.meta.stringToEnum(Key, key_str) orelse return null;
+            return .{ .key = key, .op = .ne, .value = value };
+        }
+        if (std.mem.indexOf(u8, s, "=")) |idx| {
+            const key_str = std.mem.trim(u8, s[0..idx], " \t");
+            const value = std.mem.trim(u8, s[idx + 1 ..], " \t");
+            const key = std.meta.stringToEnum(Key, key_str) orelse return null;
+            return .{ .key = key, .op = .eq, .value = value };
+        }
+        return null;
+    }
 };
 
 test "conditional enum match" {
@@ -172,4 +191,58 @@ test "app conditional null handling" {
         .op = .ne,
         .value = "vim",
     }));
+}
+
+test "Conditional.parse basic" {
+    const testing = std.testing;
+
+    // Parse "app=claude"
+    const cond1 = Conditional.parse("app=claude").?;
+    try testing.expectEqual(Key.app, cond1.key);
+    try testing.expectEqual(Conditional.Op.eq, cond1.op);
+    try testing.expectEqualStrings("claude", cond1.value);
+
+    // Parse "theme=dark"
+    const cond2 = Conditional.parse("theme=dark").?;
+    try testing.expectEqual(Key.theme, cond2.key);
+    try testing.expectEqual(Conditional.Op.eq, cond2.op);
+    try testing.expectEqualStrings("dark", cond2.value);
+}
+
+test "Conditional.parse with negation" {
+    const testing = std.testing;
+
+    // Parse "app!=vim"
+    const cond = Conditional.parse("app!=vim").?;
+    try testing.expectEqual(Key.app, cond.key);
+    try testing.expectEqual(Conditional.Op.ne, cond.op);
+    try testing.expectEqualStrings("vim", cond.value);
+}
+
+test "Conditional.parse with whitespace" {
+    const testing = std.testing;
+
+    // Parse with spaces around operators
+    const cond1 = Conditional.parse("app = claude").?;
+    try testing.expectEqual(Key.app, cond1.key);
+    try testing.expectEqual(Conditional.Op.eq, cond1.op);
+    try testing.expectEqualStrings("claude", cond1.value);
+
+    const cond2 = Conditional.parse("app != vim").?;
+    try testing.expectEqual(Key.app, cond2.key);
+    try testing.expectEqual(Conditional.Op.ne, cond2.op);
+    try testing.expectEqualStrings("vim", cond2.value);
+}
+
+test "Conditional.parse invalid" {
+    const testing = std.testing;
+
+    // Invalid key
+    try testing.expect(Conditional.parse("invalid=value") == null);
+
+    // No operator
+    try testing.expect(Conditional.parse("appvalue") == null);
+
+    // Empty string
+    try testing.expect(Conditional.parse("") == null);
 }

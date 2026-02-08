@@ -8,8 +8,20 @@ const internal_os = @import("../os/main.zig");
 const Diagnostic = diags.Diagnostic;
 const DiagnosticList = diags.DiagnosticList;
 const CommaSplitter = @import("CommaSplitter.zig");
+const conditional = @import("../config/conditional.zig");
+const Conditional = conditional.Conditional;
 
 const log = std.log.scoped(.cli);
+
+/// Return value for parseManuallyHook callbacks.
+pub const HookResult = enum {
+    /// Continue with normal parsing of this arg.
+    @"continue",
+    /// Skip this arg but continue parsing the next one.
+    skip,
+    /// Stop all parsing.
+    stop,
+};
 
 // TODO:
 //   - Only `--long=value` format is accepted. Do we want to allow
@@ -88,11 +100,20 @@ pub fn parse(
     while (iter.next()) |arg| {
         // Do manual parsing if we have a hook for it.
         if (@hasDecl(T, "parseManuallyHook")) {
-            if (!try dst.parseManuallyHook(
-                arena_alloc,
-                arg,
-                iter,
-            )) return;
+            const result = try dst.parseManuallyHook(arena_alloc, arg, iter);
+            // Support both bool (legacy) and HookResult return types
+            const ResultType = @TypeOf(result);
+            if (ResultType == bool) {
+                if (!result) return; // false means stop
+            } else if (ResultType == HookResult) {
+                switch (result) {
+                    .@"continue" => {}, // Continue with normal parsing of this arg
+                    .skip => continue, // Skip this arg, continue to next
+                    .stop => return, // Stop all parsing
+                }
+            } else {
+                @compileError("parseManuallyHook must return bool or HookResult");
+            }
         }
 
         // If the destination supports help then we check for it, call
@@ -1398,6 +1419,9 @@ pub const LineIterator = struct {
     /// like 4 years and be wrong about this.
     pub const MAX_LINE_SIZE = 4096;
 
+    /// Maximum number of conditions that can be active at once.
+    pub const MAX_CONDITIONS = 8;
+
     /// Our stateful reader.
     r: *std.Io.Reader,
 
@@ -1415,8 +1439,99 @@ pub const LineIterator = struct {
     /// is formatted to be compatible with the parse function.
     entry: [MAX_LINE_SIZE]u8 = [_]u8{ '-', '-' } ++ ([_]u8{0} ** (MAX_LINE_SIZE - 2)),
 
+    /// Active conditions from section headers like `[conditional:app=claude]`.
+    /// These conditions apply to all subsequent config lines until a new
+    /// section header is encountered or an empty `[]` resets to global scope.
+    active_conditions: [MAX_CONDITIONS]Conditional = undefined,
+    active_conditions_len: usize = 0,
+
+    /// Buffer for storing condition values. The condition values point into
+    /// the entry buffer which gets reused, so we need to copy them here.
+    condition_values_buf: [MAX_LINE_SIZE]u8 = undefined,
+    condition_values_len: usize = 0,
+
+    /// Set to true if there was an error parsing a section header.
+    section_parse_error: bool = false,
+
     pub fn init(reader: *std.Io.Reader) Self {
         return .{ .r = reader };
+    }
+
+    /// Returns the currently active conditions, or null if in global scope.
+    pub fn getActiveConditions(self: *const Self) ?[]const Conditional {
+        if (self.active_conditions_len == 0) return null;
+        return self.active_conditions[0..self.active_conditions_len];
+    }
+
+    /// Parse a section header like `conditional:app=claude` or empty string for `[]`.
+    /// The input should be the content between the brackets (excluding the brackets).
+    fn parseSectionHeader(self: *Self, content: []const u8) void {
+        // Empty section header `[]` resets to global scope
+        if (content.len == 0) {
+            self.active_conditions_len = 0;
+            self.section_parse_error = false;
+            return;
+        }
+
+        // Section headers must start with "conditional:"
+        const prefix = "conditional:";
+        if (!mem.startsWith(u8, content, prefix)) {
+            log.warn("unknown section type in \"{s}\" line {}: [{s}]", .{ self.filepath, self.line, content });
+            self.section_parse_error = true;
+            return;
+        }
+
+        const conditions_str = content[prefix.len..];
+        if (conditions_str.len == 0) {
+            log.warn("empty conditional section in \"{s}\" line {}", .{ self.filepath, self.line });
+            self.section_parse_error = true;
+            return;
+        }
+
+        // Parse comma-separated conditions
+        self.active_conditions_len = 0;
+        self.condition_values_len = 0;
+        self.section_parse_error = false;
+
+        var iter = mem.splitScalar(u8, conditions_str, ',');
+        while (iter.next()) |cond_str| {
+            const trimmed = mem.trim(u8, cond_str, " \t");
+            if (trimmed.len == 0) continue;
+
+            if (self.active_conditions_len >= MAX_CONDITIONS) {
+                log.warn("too many conditions in section header in \"{s}\" line {} (max {})", .{
+                    self.filepath,
+                    self.line,
+                    MAX_CONDITIONS,
+                });
+                self.section_parse_error = true;
+                return;
+            }
+
+            if (Conditional.parse(trimmed)) |cond| {
+                // Copy the value into our persistent buffer since the entry buffer
+                // will be reused when reading the next line
+                if (self.condition_values_len + cond.value.len > self.condition_values_buf.len) {
+                    log.warn("condition values too long in \"{s}\" line {}", .{ self.filepath, self.line });
+                    self.section_parse_error = true;
+                    return;
+                }
+                const value_start = self.condition_values_len;
+                @memcpy(self.condition_values_buf[value_start .. value_start + cond.value.len], cond.value);
+                self.condition_values_len += cond.value.len;
+
+                self.active_conditions[self.active_conditions_len] = .{
+                    .key = cond.key,
+                    .op = cond.op,
+                    .value = self.condition_values_buf[value_start .. value_start + cond.value.len],
+                };
+                self.active_conditions_len += 1;
+            } else {
+                log.warn("invalid condition \"{s}\" in \"{s}\" line {}", .{ trimmed, self.filepath, self.line });
+                self.section_parse_error = true;
+                return;
+            }
+        }
     }
 
     pub fn next(self: *Self) ?[]const u8 {
@@ -1454,6 +1569,12 @@ pub const LineIterator = struct {
             if (trim.len != entry.len) {
                 std.mem.copyForwards(u8, entry, trim);
                 entry = entry[0..trim.len];
+            }
+
+            // Check for section headers like [conditional:app=claude] or []
+            if (entry.len >= 2 and entry[0] == '[' and entry[entry.len - 1] == ']') {
+                self.parseSectionHeader(entry[1 .. entry.len - 1]);
+                continue; // Section headers don't produce output
             }
 
             // Ignore blank lines and comments
@@ -1624,4 +1745,97 @@ test "LineIterator with buffered and primed reader" {
     try testing.expectEqualStrings("--B=C", iter.next().?);
     try testing.expectEqual(@as(?[]const u8, null), iter.next());
     try testing.expectEqual(@as(?[]const u8, null), iter.next());
+}
+
+test "LineIterator with section headers" {
+    const testing = std.testing;
+    var reader: std.Io.Reader = .fixed(
+        \\A=1
+        \\[conditional:app=claude]
+        \\B=2
+        \\C=3
+        \\[]
+        \\D=4
+    );
+
+    var iter: LineIterator = .init(&reader);
+
+    // First line - global scope
+    try testing.expectEqualStrings("--A=1", iter.next().?);
+    try testing.expect(iter.getActiveConditions() == null);
+
+    // After section header [conditional:app=claude]
+    try testing.expectEqualStrings("--B=2", iter.next().?);
+    const conds1 = iter.getActiveConditions().?;
+    try testing.expectEqual(@as(usize, 1), conds1.len);
+    try testing.expectEqual(conditional.Key.app, conds1[0].key);
+    try testing.expectEqual(Conditional.Op.eq, conds1[0].op);
+    try testing.expectEqualStrings("claude", conds1[0].value);
+
+    // Still in conditional section
+    try testing.expectEqualStrings("--C=3", iter.next().?);
+    try testing.expect(iter.getActiveConditions() != null);
+
+    // After empty section header [] - back to global
+    try testing.expectEqualStrings("--D=4", iter.next().?);
+    try testing.expect(iter.getActiveConditions() == null);
+
+    try testing.expectEqual(@as(?[]const u8, null), iter.next());
+}
+
+test "LineIterator with multiple conditions" {
+    const testing = std.testing;
+    var reader: std.Io.Reader = .fixed(
+        \\[conditional:app=claude,theme=dark]
+        \\A=1
+    );
+
+    var iter: LineIterator = .init(&reader);
+    try testing.expectEqualStrings("--A=1", iter.next().?);
+
+    const conds = iter.getActiveConditions().?;
+    try testing.expectEqual(@as(usize, 2), conds.len);
+    try testing.expectEqual(conditional.Key.app, conds[0].key);
+    try testing.expectEqualStrings("claude", conds[0].value);
+    try testing.expectEqual(conditional.Key.theme, conds[1].key);
+    try testing.expectEqualStrings("dark", conds[1].value);
+}
+
+test "LineIterator with negation condition" {
+    const testing = std.testing;
+    var reader: std.Io.Reader = .fixed(
+        \\[conditional:app!=vim]
+        \\A=1
+    );
+
+    var iter: LineIterator = .init(&reader);
+    try testing.expectEqualStrings("--A=1", iter.next().?);
+
+    const conds = iter.getActiveConditions().?;
+    try testing.expectEqual(@as(usize, 1), conds.len);
+    try testing.expectEqual(conditional.Key.app, conds[0].key);
+    try testing.expectEqual(Conditional.Op.ne, conds[0].op);
+    try testing.expectEqualStrings("vim", conds[0].value);
+}
+
+test "LineIterator section header replaces previous" {
+    const testing = std.testing;
+    var reader: std.Io.Reader = .fixed(
+        \\[conditional:app=claude]
+        \\A=1
+        \\[conditional:theme=dark]
+        \\B=2
+    );
+
+    var iter: LineIterator = .init(&reader);
+
+    try testing.expectEqualStrings("--A=1", iter.next().?);
+    var conds = iter.getActiveConditions().?;
+    try testing.expectEqual(@as(usize, 1), conds.len);
+    try testing.expectEqual(conditional.Key.app, conds[0].key);
+
+    try testing.expectEqualStrings("--B=2", iter.next().?);
+    conds = iter.getActiveConditions().?;
+    try testing.expectEqual(@as(usize, 1), conds.len);
+    try testing.expectEqual(conditional.Key.theme, conds[0].key);
 }
