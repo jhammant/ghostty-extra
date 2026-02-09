@@ -19,6 +19,72 @@
   </p>
 </p>
 
+## ghostty-extra
+
+This is a fork of [Ghostty](https://github.com/ghostty-org/ghostty) with additional features on the `feat/per-app-conditional-config` branch. These features are fully functional and can be built from source.
+
+### Additional Features
+
+#### 1. Scrollback Clear Protection (`scrollback-clear-allowed`)
+
+A new config option that prevents applications from clearing your scrollback buffer via the CSI 3 J escape sequence. This is useful when programs like `clear`, shell logout scripts, or tools like Claude Code attempt to wipe your scrollback history.
+
+```ini
+# Prevent all apps from clearing scrollback
+scrollback-clear-allowed = false
+```
+
+When set to `false`, CSI 3 J is silently ignored and the scrollback buffer remains intact. The visible screen can still be cleared normally. Similar to iTerm2's "Prevent CSI 3 J from clearing scrollback history" option.
+
+#### 2. Per-App Conditional Configuration (`[conditional:app=...]`)
+
+Allows configuration options to apply only when a specific application is running as the foreground process in the terminal. The terminal detects the foreground app via shell integration (OSC 2 window title) and dynamically applies or removes config overrides when the app changes.
+
+This uses INI-style section headers in the config file:
+
+```ini
+# Only disable scrollback clearing when Claude Code is running
+[conditional:app=claude]
+scrollback-clear-allowed = false
+
+# Use a different font size when running vim
+[conditional:app=vim]
+font-size = 20
+```
+
+The app name is matched against the command name (not the full path). Multiple conditions can be combined:
+
+```ini
+[conditional:app=vim,theme=dark]
+font-size = 18
+```
+
+All existing Ghostty config options can be used within conditional sections.
+
+### Building from Source
+
+```bash
+git clone https://github.com/jhammant/ghostty-extra.git
+cd ghostty-extra
+git checkout feat/per-app-conditional-config
+zig build -Doptimize=ReleaseFast -Demit-macos-app
+# The built app will be in zig-out/
+```
+
+### Files Changed (vs upstream)
+
+| File | Changes |
+|------|---------|
+| `src/config/Config.zig` | `scrollback-clear-allowed` option, conditional config replay system, `cloneEmpty` fix |
+| `src/config/conditional.zig` | `app` conditional key, state matching |
+| `src/cli/args.zig` | INI-style `[conditional:...]` section header parsing |
+| `src/termio/stream_handler.zig` | App context detection from window title |
+| `src/Surface.zig` | App context state management and config reload triggering |
+| `src/apprt/surface.zig` | `app_context` message type |
+| `src/termio/Termio.zig` | App context message forwarding |
+
+---
+
 ## About
 
 Ghostty is a terminal emulator that differentiates itself by being
