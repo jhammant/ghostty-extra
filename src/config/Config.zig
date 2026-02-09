@@ -4616,6 +4616,14 @@ pub fn parseManuallyHook(
             .arg = try alloc.dupe(u8, arg),
         } });
 
+        // Mark the conditional key as used so changeConditionalState knows to replay.
+        // This must happen before the match check below, because even if conditions
+        // don't match now (e.g. app=vim when no app is running), we need
+        // changeConditionalState to know it should replay when the state changes.
+        for (conds) |cond| {
+            self._conditional_set.insert(cond.key);
+        }
+
         // Check if conditions match the current state
         // If they don't match, skip parsing this arg but continue with the next one
         for (conds) |cond| {
@@ -4623,11 +4631,6 @@ pub fn parseManuallyHook(
                 // Conditions don't match - skip parsing but continue with next arg
                 return .skip;
             }
-        }
-
-        // Mark the conditional key as used so changeConditionalState knows to replay
-        for (conds) |cond| {
-            self._conditional_set.insert(cond.key);
         }
     } else {
         try self._replay_steps.append(
@@ -4794,6 +4797,7 @@ pub fn cloneEmpty(
 ) Allocator.Error!Config {
     var result = try default(alloc_gpa);
     result._conditional_state = self._conditional_state;
+    result._conditional_set = self._conditional_set;
     return result;
 }
 
@@ -5074,6 +5078,21 @@ const Replay = struct {
                         // All conditions must match.
                         for (v.conditions) |cond| {
                             if (!self.config._conditional_state.match(cond)) {
+                                // Conditions don't match now, but we still need to
+                                // preserve this entry in the replay steps so that
+                                // changeConditionalState can apply it later when
+                                // the state changes (e.g. app switches to "vim").
+                                const arena_alloc = self.config._arena.?.allocator();
+                                const conds = arena_alloc.alloc(Conditional, v.conditions.len) catch break :conditional;
+                                for (v.conditions, 0..) |cond_item, i| {
+                                    conds[i] = cond_item.clone(arena_alloc) catch break :conditional;
+                                }
+                                self.config._replay_steps.append(arena_alloc, .{
+                                    .conditional_arg = .{
+                                        .conditions = conds,
+                                        .arg = arena_alloc.dupe(u8, v.arg) catch break :conditional,
+                                    },
+                                }) catch {};
                                 break :conditional;
                             }
                         }
@@ -10534,8 +10553,8 @@ test "conditional replay applies when state matches" {
     // Default state (no app set) - should have value 1000
     try testing.expectEqual(@as(u32, 1000), cfg.@"scrollback-limit");
 
-    // Mark the 'app' key as conditional so changeConditionalState will replay
-    cfg._conditional_set.insert(.app);
+    // Parsing should auto-populate _conditional_set with 'app'
+    try testing.expect(cfg._conditional_set.contains(.app));
 
     // Change state to app=claude using changeConditionalState - should have value 2000
     var cfg2 = (try cfg.changeConditionalState(.{ .app = "claude" })).?;
@@ -10561,12 +10580,69 @@ test "conditional replay does not apply when state does not match" {
     try cli.args.parse(Config, alloc, &cfg, &iter);
     try cfg.finalize();
 
-    // Mark the 'app' key as conditional so changeConditionalState will replay
-    cfg._conditional_set.insert(.app);
+    // Parsing should auto-populate _conditional_set with 'app'
+    try testing.expect(cfg._conditional_set.contains(.app));
 
     // Change state to app=vim using changeConditionalState - should still have value 1000
     var cfg2 = (try cfg.changeConditionalState(.{ .app = "vim" })).?;
     defer cfg2.deinit();
 
     try testing.expectEqual(@as(u32, 1000), cfg2.@"scrollback-limit");
+}
+
+test "conditional section parsing populates _conditional_set" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    // Parse config with conditional section - should auto-populate _conditional_set
+    var reader: std.Io.Reader = .fixed(
+        \\scrollback-limit = 1000
+        \\[conditional:app=vim]
+        \\scrollback-limit = 2000
+    );
+    var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = "test" };
+    try cli.args.parse(Config, alloc, &cfg, &iter);
+    try cfg.finalize();
+
+    // The _conditional_set should have 'app' set from parsing the section header
+    try testing.expect(cfg._conditional_set.contains(.app));
+
+    // Without manually setting _conditional_set, changeConditionalState should work
+    var cfg2 = (try cfg.changeConditionalState(.{ .app = "vim" })).?;
+    defer cfg2.deinit();
+
+    try testing.expectEqual(@as(u32, 2000), cfg2.@"scrollback-limit");
+}
+
+test "conditional_arg survives theme loading replay" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    // Parse config with a theme AND a conditional app section
+    var reader: std.Io.Reader = .fixed(
+        \\theme = light:iTerm2 Solarized Dark,dark:iTerm2 Solarized Dark
+        \\scrollback-limit = 1000
+        \\[conditional:app=vim]
+        \\scrollback-limit = 2000
+    );
+    var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = "test" };
+    try cli.args.parse(Config, alloc, &cfg, &iter);
+
+    // Finalize triggers theme loading which does cloneEmpty + replay
+    try cfg.finalize();
+
+    // After finalize, _conditional_set should still have 'app'
+    try testing.expect(cfg._conditional_set.contains(.app));
+
+    // changeConditionalState should work after theme loading
+    var cfg2 = (try cfg.changeConditionalState(.{ .app = "vim" })).?;
+    defer cfg2.deinit();
+
+    try testing.expectEqual(@as(u32, 2000), cfg2.@"scrollback-limit");
 }
